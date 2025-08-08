@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from functools import partial
 from typing import Optional, Union
+from math import ceil
 
 import torch
 import torch.nn as nn
@@ -60,6 +61,9 @@ class GenerationOutput:
         generated_tokens (list[int]): The generated tokens.
         logprobs (list[float]): The log probabilities of the generated tokens.
         error (Optional[str]): Any error message associated with the request. When None, the request was successful.
+        status (RequestStatus): The status of the request.
+        created_time (float): The time the request was created.
+        next_token (Optional[int]): The next token to be generated.
     """
 
     request_id: str
@@ -77,24 +81,36 @@ class RequestState:
     """Tracks the state of a generation request through its lifecycle.
 
     Attributes:
-        status (RequestStatus): can be one of PENDING, PREFILLING, PREFILLING_SPLIT,
+        request_id (str): The ID of the generation request.
+        full_prompt_ids (list[int] | None): The tokens IDs of the full prompt.
+        prompt_ids (list[int] | None): The tokens IDs currently being processed.
+        remaining_prompt_ids (list[int]): The tokens IDs remaining to be processed (for split requests).
+        static_outputs (list[int]): The generated tokens.
+        allocated_blocks (list[int]): The identifiers of the allocated blocks to the request.
+        position_offset (int): The current position in the sequence for position_ids.
+        status (RequestStatus): The status of the request: can be one of PENDING, PREFILLING, PREFILLING_SPLIT,
                                 SPLIT_PENDING_REMAINDER, DECODING, FINISHED, FAILED
+        max_new_tokens (int): The maximum number of new tokens to generate.
+        eos_token_id (int): The ID of the end-of-sequence token.
+        created_time (float): The time the request was created.
+        error (Optional[str]): Any error message associated with the request. When None, has had no error yet.
+        next_token (Optional[str]): The next token to be generated.
     """
 
     # Required fields
     request_id: str
-    prompt_ids: Optional[list[int]] = None  # the one being processed
-    full_prompt_ids: Optional[list[int]] = None  # the full prompt
-    remaining_prompt_ids: list[int] = field(default_factory=list)  # For split requests
-    static_outputs: list[int] = field(default_factory=list)
-    allocated_blocks: list[int] = field(default_factory=list)
+    full_prompt_ids: Optional[list[int]] = None  # Full initial prompt
+    prompt_ids: Optional[list[int]] = None  # Tokens IDs currently being processed (initial + generated)
+    remaining_prompt_ids: list[int] = field(default_factory=list)  # For split requests, prefill left to process
+    static_outputs: list[int] = field(default_factory=list)  # Generated tokens
+    allocated_blocks: list[int] = field(default_factory=list)  # Block IDs allocated to the request
     position_offset: int = 0  # Current position in the sequence for position_ids
-    status: RequestStatus = RequestStatus.PENDING
-    max_new_tokens: int = 20
-    eos_token_id: int = -1
-    created_time: float = field(default_factory=time.time)
-    error: Optional[str] = None
-    next_token: Optional[str] = None
+    status: RequestStatus = RequestStatus.PENDING  # Status of the request
+    max_new_tokens: int = 20  # Maximum number of new tokens to generate
+    eos_token_id: int = -1  # ID of the end-of-sequence token
+    created_time: float = field(default_factory=time.time)  # Time the request was created
+    error: Optional[str] = None  # Error message if the request failed
+    next_token: Optional[str] = None  # Next token to be generated
 
     def current_len(self) -> int:
         """Get the current length of the sequence (prompt + generated tokens)."""
@@ -114,22 +130,22 @@ class RequestState:
         Returns:
             bool: True if the request is now complete, False otherwise
         """
-        # Only update if we're in decoding state
+        # Only update if we're in decoding state # NOTE: should we not raise an error if we're not in decoding state?
         if self.status != RequestStatus.DECODING:
             return False
 
-        is_eos = token_id == self.eos_token_id and self.eos_token_id != -1
-        is_max_len = self.generated_len() >= self.max_new_tokens
+        is_eos = (self.eos_token_id != -1) and (token_id == self.eos_token_id)
+        left_to_generate = self.max_new_tokens - self.generated_len()
 
-        # Only add the token if we're not finishing due to max length
-        # (EOS tokens should still be added to the output)
-        if not (is_max_len and not is_eos):
+        # Add the token if we're not finishing due to max length or if token is EOS
+        if is_eos or left_to_generate > 0:
             self.static_outputs.extend([token_id])
+            left_to_generate -= 1
 
-        if is_eos or is_max_len:
+        # Check if the request is complete
+        if is_eos or left_to_generate <= 0:
             self.status = RequestStatus.FINISHED
-            return True
-        return False
+        return (self.status == RequestStatus.FINISHED)
 
     def __repr__(self):
         return f"RequestState(\n\trequest_id={self.request_id},\n\tstatus={self.status},\n\tout_tokens={self.generated_len()},\n\tquery_length={len(self.prompt_ids)}, \n\tremaining_tokens={len(self.remaining_prompt_ids)}, \n\tkv_length={self.position_offset}\n\tfull_prompt_lenght={len(self.full_prompt_ids)},\n\tallocated_blocks={self.allocated_blocks},\n\tgenerated_tokens={self.static_outputs}\n)"
@@ -155,71 +171,64 @@ class PagedAttentionCache:
         generation_config: GenerationConfig,
         device: torch.device,
         dtype: torch.dtype = torch.float16,
-        num_requests: int = 100,
         layer_device_map: Optional[dict[int, Union[str, torch.device, int]]] = None,
         tp_size: Optional[int] = None,
     ) -> None:
         """Initialize a paged attention cache for efficient memory usage.
 
         Args:
-            config: Model configuration
-            generation_config: Generation configuration containing cache parameters
-            device: Device for the cache tensors
-            dtype: Data type for the cache tensors
-            layer_device_map: Optional mapping of layer indices to devices
-            initial_prompt_shapes: Optional sample prompts to help calculate optimal cache size
+            config (PretrainedConfig): Model configuration
+            generation_config (GenerationConfig): Generation configuration containing cache parameters
+            device (torch.device): Device for the cache tensors
+            dtype (torch.dtype): Data type for the cache tensors
+            layer_device_map (Optional[dict[int, Union[str, torch.device, int]]]): Optional dict of layer indices to devices
+            tp_size (Optional[int]): Optional tensor parallel size
         """
         # Extract model dimensions
-        self.num_key_value_heads = (
-            config.num_attention_heads
-            if getattr(config, "num_key_value_heads", None) is None
-            else config.num_key_value_heads
-        )
-        num_key_value_heads = self.num_key_value_heads
-        if tp_size is not None and tp_size > 1:
-            if num_key_value_heads % tp_size != 0:
-                raise ValueError(
-                    f"Number of key value heads {num_key_value_heads} must be divisible by tensor parallel size {tp_size}."
-                )
-            # If the model is using tensor parallelism, we need to adjust the number of heads accordingly.
-            # self.num_key_value_heads //= tp_size
-
-        self.head_dim = (
-            config.head_dim if hasattr(config, "head_dim") else config.hidden_size // config.num_attention_heads
-        )
+        kv_heads = getattr(config, "num_key_value_heads", None)
+        self.num_key_value_heads = config.num_attention_heads if kv_heads is None else kv_heads
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_hidden_layers = config.num_hidden_layers
 
-        # Calculate optimal block size and number if not provided
-        num_blocks = getattr(generation_config, "num_blocks", 1024)
-        block_size = getattr(generation_config, "block_size", 32)
-        max_memory_percent = getattr(generation_config, "max_memory", 0.9)
-        max_batch_tokens = getattr(generation_config, "max_batch_tokens", 256)
-        if num_blocks is None or max_batch_tokens is None:
-            num_blocks, max_batch_tokens = compute_optimal_blocks(
-                generation_config.max_new_tokens,
-                block_size=block_size,
-                head_dim=self.head_dim,
-                num_layers=self.num_hidden_layers,
-                num_heads=self.num_key_value_heads,
-                max_memory_percent=max_memory_percent,
-                dtype=dtype,
-                num_blocks=num_blocks,
-            )
-        logger.warning(
-            f"Using calculated num_blocks={num_blocks}, block_size={block_size}, max concurrent requests {max_batch_tokens}"
-        )
-        self.max_batch_tokens = max_batch_tokens
-        self.block_size = block_size
-        self.num_blocks = num_blocks
-        self.cache_shape = (num_key_value_heads, num_blocks, self.block_size, self.head_dim)
+        # Account for tensor parallelism
+        if tp_size is not None and tp_size > 1:
+            if self.num_key_value_heads % tp_size != 0:
+                raise ValueError(
+                    f"Number of key value heads {self.num_key_value_heads} must be divisible by tensor parallel size {tp_size}."
+                )
+            # If the model is using tensor parallelism, we need to adjust the number of heads accordingly.
+            # self.num_key_value_heads //= tp_size # TODO: why is this commented out?
 
+        # Compute the optimal number of blocks or validate the provided number of blocks
+        self.block_size = getattr(generation_config, "block_size", 32)
+        self.num_blocks = infer_num_blocks(
+            block_size=self.block_size,
+            head_dim=self.head_dim,
+            num_layers=self.num_hidden_layers,
+            num_heads=self.num_key_value_heads,
+            max_memory_percent=getattr(generation_config, "max_memory", 0.9),
+            kv_cache_dtype=dtype,
+            num_blocks=getattr(generation_config, "num_blocks", None),
+        )
+        logger.warning(f"Using calculated num_blocks={self.num_blocks}, block_size={self.block_size}")
+
+        # Compute the maximum number of tokens that can be processed in a single batch
+        self.max_batch_tokens = getattr(generation_config, "max_batch_tokens", 256)
+        self.cache_shape = (self.num_blocks, self.block_size, self.num_key_value_heads, self.head_dim)
         self.dtype = dtype
         self.device = device
-
         self.key_cache: list[torch.Tensor] = []
         self.value_cache: list[torch.Tensor] = []
-        for idx in range(config.num_hidden_layers):
-            layer_device = layer_device_map[idx] if layer_device_map is not None else device
+        self._init_kv_cache(layer_device_map)
+
+        # Block management data structures
+        self._free_blocks = deque(range(self.num_blocks))
+        self._block_tables: dict[str, list[int]] = {}
+
+    def _init_kv_cache(self, layer_device_map: Optional[dict[int, Union[str, torch.device, int]]]) -> None:
+        """Initializes the key and value caches using the provided (layer_device_map)."""
+        for idx in range(self.num_hidden_layers):
+            layer_device = layer_device_map[idx] if layer_device_map is not None else self.device
             new_layer_key_cache = torch.zeros(self.cache_shape, dtype=self.dtype, device=layer_device)
             new_layer_value_cache = torch.zeros(self.cache_shape, dtype=self.dtype, device=layer_device)
             # Note: `mark_static_address` is used to tag the cache as a fixed data pointer,
@@ -229,50 +238,50 @@ class PagedAttentionCache:
             self.key_cache.append(new_layer_key_cache)
             self.value_cache.append(new_layer_value_cache)
 
-        # Block management data structures
-        self._free_blocks = deque(range(num_blocks))
-        self._block_tables: dict[str, list[int]] = {}
-
     @traced
-    def allocate_blocks(self, n_blocks: int, request_id: str) -> list[int]:
-        """Allocates n_blocks for a given request_id."""
+    def allocate_blocks(self, n_blocks: int, request_id: str) -> Optional[list[int]]:
+        """Tries to alloc (n_blocks) for a given (request_id). Returns None if it fails."""
+        # Stop if we don't have enough free blocks
         if len(self._free_blocks) < n_blocks:
-            return False
-
+            return None
+        # Allocate the blocks
         allocated = []
         for _ in range(n_blocks):
             allocated.append(self._free_blocks.popleft())
-
+        # If this is a new request, create a new block table
         if request_id not in self._block_tables:
             self._block_tables[request_id] = []
+        # Mark the blocks as allocated in the block table
         self._block_tables[request_id].extend(allocated)
         return allocated
 
     @traced
     def free_blocks(self, request_id: str) -> None:
-        """Frees all blocks associated with a request_id."""
+        """Frees all blocks associated with a (request_id)."""
         if request_id in self._block_tables:
             blocks_to_free = self._block_tables.pop(request_id)
             self._free_blocks.extend(blocks_to_free)
         else:
-            logger.info(f"Attempted to free blocks for non-existent request_id: {request_id}")
+            logger.warning(f"Attempted to free blocks for non-existent request_id: {request_id}")
 
     def get_num_free_blocks(self) -> int:
         """Returns the number of free blocks available."""
         return len(self._free_blocks)
 
     def get_block_table(self, request_id: str) -> list[int]:
-        """Returns the block table for a request."""
+        """Returns the block table for a (request_id). If the request_id is not found, returns an empty list not
+        referenced in the block table."""
         return self._block_tables.get(request_id, [])
 
     @traced
-    def _get_physical_indices(self, state: RequestState, logical_indices: list[int]) -> list[int]:
+    def _get_physical_indices(self, request_state: RequestState, logical_indices: list[int]) -> list[int]:
         """
-        Maps logical sequence indices to physical cache indices using the block table, using PyTorch.
+        Maps logical sequence indices (tok_0, tok_1, ..., tok_n, ...) to physical cache indices (block_i, block_i, ...,
+        block_j, ...) using the block table.
 
         Args:
-            request_id: The request ID.
-            logical_indices: A list of logical indices.
+            - request_state: The request state.
+            - logical_indices: A list of logical sequence indices.
 
         Returns:
             A list of physical indices.
@@ -281,28 +290,26 @@ class PagedAttentionCache:
             ValueError: If no block table is found for the request ID.
             IndexError: If a logical index maps to a block index that is out of bounds.
         """
-        request_id = state.request_id
+        # Get the block table for the request or raise a ValueError if it doesn't exist
+        request_id = request_state.request_id
         block_table = self._block_tables.get(request_id)
         if not block_table:
             raise ValueError(f"No block table found for request {request_id}")
-
-        block_size = self.block_size
+        # Map the logical indices to physical indices
         physical_indices = []
-
         for idx in logical_indices:
-            block_idx = idx // block_size
-            block_offset = idx % block_size
-
+            block_idx = idx // self.block_size
+            block_offset = idx % self.block_size
+            # Raise an IndexError if the block index is out of bounds
             if block_idx >= len(block_table):
                 raise IndexError(
                     f"Logical index {idx} maps to block index {block_idx} which is out of bounds "
                     f"for request {request_id}"
                 )
-
+            # Get the physical block number and compute the physical index
             physical_block_num = block_table[block_idx]
-            physical_index = physical_block_num * block_size + block_offset
+            physical_index = physical_block_num * self.block_size + block_offset
             physical_indices.append(physical_index)
-
         return physical_indices
 
     @traced
@@ -311,17 +318,17 @@ class PagedAttentionCache:
         key_states: torch.Tensor,
         value_states: torch.Tensor,
         layer_idx: int,
-        read_index,
-        write_index,
+        read_index: int,
+        write_index: int,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Reshape cache for easier indexing
         total_slots = self.num_blocks * self.block_size
-        k_cache_flat = self.key_cache[layer_idx].view(self.num_key_value_heads, total_slots, self.head_dim)
-        v_cache_flat = self.value_cache[layer_idx].view(self.num_key_value_heads, total_slots, self.head_dim)
-        k_cache_flat[:, write_index, :] = key_states[0]
-        v_cache_flat[:, write_index, :] = value_states[0]
-        return k_cache_flat[None, :, read_index, :], v_cache_flat[None, :, read_index, :]
+        k_cache_flat = self.key_cache[layer_idx].view(total_slots, self.num_key_value_heads, self.head_dim)
+        v_cache_flat = self.value_cache[layer_idx].view(total_slots, self.num_key_value_heads, self.head_dim)
+        k_cache_flat[write_index] = key_states[0]
+        v_cache_flat[write_index] = value_states[0]
+        return k_cache_flat[read_index], v_cache_flat[read_index]
 
 
 class Scheduler(ABC):
@@ -362,33 +369,41 @@ class Scheduler(ABC):
             return self.active_requests[request_id].static_outputs
         return []
 
+    @traced
+    def _allocate_blocks_if_needed(self, request: RequestState, space_needed: int) -> bool:
+        """
+        Allocates enough blocks to the given (request) so that the space available in cache is more than
+        (space_needed). Returns a boolean indicating if allocation was successful (even if 0 blocks were allocated).
+        Space is measured in tokens.
+        """
+        space_already_occupied = request.current_len()
+        space_already_allocated = len(request.allocated_blocks) * self.cache.block_size
+        space_left = space_already_allocated - space_already_occupied
+        # Allocate blocks if none have been allocated yet or if the space left is less than the space needed
+        if space_already_allocated == 0 or space_left < space_needed:
+            blocks_needed = ceil((space_needed - space_left) / self.cache.block_size)
+            blocks_needed = max(blocks_needed, 1)  # can happen if space_already_allocated == 0 # TODO: why?
+            allocated = self.cache.allocate_blocks(blocks_needed, request.request_id)
+            # Exit here if allocation failed
+            if allocated is None:
+                return False
+            request.allocated_blocks.extend(allocated)
+        return True
+
 
 @attach_tracer()
 class FIFOScheduler(Scheduler):
-    @traced
-    def _allocate_blocks_if_needed(self, state: RequestState, len_next_tokens: int):
-        # 1. we check that the occupancy is less than the requested length
-        # 2. we allocate enough blocks to cover the requested length
-        current_len = state.current_len()
-        occupancy = len(state.allocated_blocks) * self.cache.block_size - current_len
-        if occupancy < len_next_tokens or (len(state.allocated_blocks) == 0):
-            blocks_needed = ((len_next_tokens - occupancy + 1) // self.cache.block_size) + 1
-            allocated = self.cache.allocate_blocks(blocks_needed, state.request_id)
-            if not allocated:
-                return False
-            state.allocated_blocks.extend(allocated)
-        return True
 
     @traced(span_name="prepare_request")
     def _prepare_request_for_processing(
         self, state: RequestState, token_budget: int, request_ids_to_remove_from_waiting: set[str]
-    ):
-        """Prepare a request for processing in the current batch."""
+    ) -> None:
+        """Prepares a request for processing in the current batch."""
         request_tokens = (
             state.remaining_prompt_ids if state.status == RequestStatus.SPLIT_PENDING_REMAINDER else state.prompt_ids
         )
+        # Case: the token budget is enough to process the entire prompt/remainder
         if len(request_tokens) < token_budget:
-            # Can process the entire prompt/remainder
             if state.status == RequestStatus.PENDING:
                 self.active_requests[state.request_id] = state
                 state.status = RequestStatus.PREFILLING
@@ -397,23 +412,27 @@ class FIFOScheduler(Scheduler):
                 state.status = RequestStatus.PREFILLING
                 state.prompt_ids = state.remaining_prompt_ids
                 state.remaining_prompt_ids = []
+            else:
+                raise RuntimeError(f"Unexpected request status: {state.status}")
+        # Otherwise, we need to split the request
         else:
-            # Need to split the request
             if state.status == RequestStatus.PENDING:
                 self.active_requests[state.request_id] = state
                 state.status = RequestStatus.PREFILLING_SPLIT
                 request_ids_to_remove_from_waiting.add(state.request_id)
             elif state.status == RequestStatus.SPLIT_PENDING_REMAINDER:
                 state.status = RequestStatus.PREFILLING_SPLIT
+            else:
+                raise RuntimeError(f"Unexpected request status: {state.status}")
             state.remaining_prompt_ids = request_tokens[token_budget:]
             state.prompt_ids = request_tokens[:token_budget]
 
     @traced
     def add_waiting_request(self, state: RequestState):
-        """Add a request to the waiting list."""
+        """Add a request to the waiting list.""" # NOTE: ?
         if self.retain_cache_on_finish and state.request_id in self.active_requests:
             old_state = self.active_requests.pop(state.request_id)
-            state.prompt_ids = state.prompt_ids[len(old_state.full_prompt_ids) :]
+            state.prompt_ids = state.prompt_ids[len(old_state.full_prompt_ids):]
             state.allocated_blocks = old_state.allocated_blocks
             state.position_offset = old_state.position_offset
         self.waiting_requests[state.request_id] = state
@@ -484,19 +503,6 @@ class FIFOScheduler(Scheduler):
 
 @attach_tracer()
 class PrefillFirstScheduler(Scheduler):
-    @traced
-    def _allocate_blocks_if_needed(self, state: RequestState, len_next_tokens: int):
-        # 1. we check that the occupancy is less than the requested length
-        # 2. we allocate enough blocks to cover the requested length
-        current_len = state.current_len()
-        occupancy = len(state.allocated_blocks) * self.cache.block_size - current_len
-        if occupancy < len_next_tokens or (len(state.allocated_blocks) == 0):
-            blocks_needed = ((len_next_tokens - occupancy + 1) // self.cache.block_size) + 1
-            allocated = self.cache.allocate_blocks(blocks_needed, state.request_id)
-            if not allocated:
-                return False
-            state.allocated_blocks.extend(allocated)
-        return True
 
     @traced(span_name="prepare_request")
     def _prepare_request_for_processing(
@@ -626,35 +632,47 @@ def get_device_and_memory():
 
 
 @traced(standalone=True)
-def compute_optimal_blocks(
-    max_num_tokens,
-    block_size,
-    head_dim,
-    num_heads,
-    num_layers,
-    max_memory_percent=0.9,
-    num_blocks=None,
-    dtype=torch.float16,
-):
-    device, total, reserved, allocated = get_device_and_memory()
+def infer_num_blocks(
+    block_size: int,
+    head_dim: int,
+    num_heads: int,
+    num_layers: int,
+    max_memory_percent: float = 0.9,
+    kv_cache_dtype: torch.dtype = torch.float16,
+    num_blocks: Optional[int] = None,
+) -> int:
+    """Returns the optimal number of blocks. If num_blocks is provided, this function will check that the number of
+        blocks is compatible with the available memory, and throw an error if not.
+
+    Args:
+        - block_size: size of a block in tokens
+        - head_dim: dimension of an attention head
+        - num_heads: number of attention heads
+        - num_layers: number of layers
+        - max_memory_percent: maximum percentage of available GPU memory that can be allocated to the KV cache
+        - kv_cache_dtype: data type of the KV cache, torch.float16 by default
+        - num_blocks: optional number of blocks to use. If None, the optimal number of blocks is computed
+
+    Returns:
+        - num_blocks (int): number of blocks to use
+    """
+    # Compute available memory
+    _, total, reserved, allocated = get_device_and_memory()
     available_memory = int((total - max(allocated, reserved)) * max_memory_percent)
 
-    dtype_size = torch.tensor([], dtype=dtype).element_size()
-    bytes_per_token = 2 * num_heads * head_dim * dtype_size * num_layers
+    # Compute bytes per block
+    bytes_per_token = 2 * num_heads * head_dim * kv_cache_dtype.itemsize * num_layers
+    bytes_per_block = block_size * bytes_per_token
+    # Early return if num_blocks is provided
     if num_blocks is not None:
-        # TODO
-        max_possible_concurrent_requests = num_blocks * bytes_per_token
-    # FIXME: forgot to add the inintial prompt length in the mix....
-    max_possible_concurrent_requests = int(
-        available_memory // (bytes_per_token * max_num_tokens * max_num_tokens // 4)
-    )
-    if max_possible_concurrent_requests <= 0:
-        logger.warning("you are trying to generate a bit too many tokens")
-        max_possible_concurrent_requests = 32
-    max_concurrent_tokens = min(64, max_possible_concurrent_requests)
-    # FIXME: Optimal means uses all memory
-    optimal_num_blocks = max(((max_concurrent_tokens * max_num_tokens) // block_size) + 1, 64)
-    return optimal_num_blocks, max_concurrent_tokens
+        blocks_memory_footprint = num_blocks * bytes_per_block
+        if blocks_memory_footprint > available_memory:
+            raise MemoryError(f"Cannot allocate {num_blocks = }, because {available_memory = } < {blocks_memory_footprint = }")
+
+    # Compute number of blocks and make sure it's at least one
+    num_blocks = available_memory // bytes_per_block
+    assert num_blocks > 0, f"Cannot allocate any blocks with {available_memory = }"
+    return num_blocks
 
 
 @dataclass
@@ -1258,7 +1276,6 @@ class ContinuousBatchingManager:
                 self.generation_config,
                 self.model.device,
                 self.model.dtype,
-                num_requests=len(self.input_queue.queue),
                 tp_size=getattr(self.model, "_tp_size", 8),  # TODO quantized converted don't set this
             )
 
