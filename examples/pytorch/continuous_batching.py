@@ -26,6 +26,7 @@ from tqdm import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.generation import GenerationConfig
+from transformers.generation.continuous_batching.requests import logger
 
 
 # MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507"
@@ -99,7 +100,6 @@ def batch_generate(
     displayed_samples: int = 0,  # -1: no display, 0: display stats, >0: display inputs and some outputs
     output_file: Optional[str] = None,
     expected_outputs: Optional[list[str]] = None,
-    slice_inputs: bool = True,
 ) -> tuple[float, float]:
     # Actual batch generation
     if displayed_samples >= 0:
@@ -108,7 +108,6 @@ def batch_generate(
     batch_outputs = model.generate_batch(
         inputs=simple_batch_inputs,
         generation_config=generation_config,
-        slice_inputs=slice_inputs,  # TODO: move this to the generation config
     )
     end_time_simple = time.time()
     if displayed_samples >= 0:
@@ -188,9 +187,7 @@ if __name__ == "__main__":
         "--attn", type=str, default="paged_attention|kernels-community/flash-attn", help="Attention implementation"
     )
     parser.add_argument("--matmul-precision", "-mp", type=str, default="high")  # set to "none" to disable
-    parser.add_argument("--no-slice-inputs", action="store_true")  # slicing is enabled by default because much faster
-    parser.add_argument("--use-cuda-graph", "-cg", action="store_true")
-    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--log-level", type=str, default="INFO")
 
     parser.add_argument("--samples", type=int, default=500)
     parser.add_argument("--displayed", type=int, default=0, help="Number of samples to display")
@@ -200,7 +197,7 @@ if __name__ == "__main__":
     parser.add_argument("--profile", type=str, default=None)
     args = parser.parse_args()
 
-    args.slice_inputs = not args.no_slice_inputs
+    logger.setLevel(args.log_level)
 
     # If turned on, we setup metrics
     if args.metrics:
@@ -221,13 +218,6 @@ if __name__ == "__main__":
         print(f"Setting sliding window from {model.config.sliding_window} to {SLIDING_WINDOW}")
         model.config.sliding_window = SLIDING_WINDOW
 
-    # If turned on, we compile the model
-    if args.compile:
-        model.forward = torch.compile(model.forward, mode="max-autotune-no-cudagraphs")
-    if args.slice_inputs:
-        assert not args.compile, "Slicing inputs requires is not the model to be compiled"
-        assert not args.use_cuda_graph, "Slicing inputs is not compatible with cuda graphs"
-
     # Prepare tokenizer and dataset
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, padding_side="left")
 
@@ -239,7 +229,6 @@ if __name__ == "__main__":
     # Prepare generation config
     generation_config = GenerationConfig(
         max_new_tokens=512,
-        use_cuda_graph=args.use_cuda_graph,
         eos_token_id=tokenizer.pad_token_id if FORCE_MAX_LENGTH else tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
         do_sample=True,
@@ -267,7 +256,6 @@ if __name__ == "__main__":
         generation_config,
         tokenizer,
         displayed_samples=-1,
-        slice_inputs=args.slice_inputs,
     )
 
     if args.profile is not None:
@@ -284,7 +272,6 @@ if __name__ == "__main__":
             displayed_samples=args.displayed,
             output_file=args.output_file,
             expected_outputs=expected_outputs,
-            slice_inputs=args.slice_inputs,
         )
     if args.profile is not None:
         filename = args.profile if args.profile.endswith(".json") else args.profile + ".json"

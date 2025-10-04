@@ -16,6 +16,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
+@torch.compiler.disable(recursive=True)
 def eager_paged_attention_forward(
     module: nn.Module,
     query: torch.Tensor,
@@ -48,6 +49,7 @@ def eager_paged_attention_forward(
 
     attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
     if causal_mask is not None:
+        causal_mask = causal_mask[..., :attn_weights.shape[-1]]
         attn_weights = attn_weights + causal_mask
 
     # Handle attention sinks if the model has them

@@ -56,7 +56,7 @@ def build_attention_mask(
            █ █ █ █ █ █ █ █
 
     SLIDING WINDOW MASK:
-         ┌──────────────────────── seqlen_k - seqlen_q - sliding_window = 8 - 4 - 6 = -2 offset to the right
+         ┌──────────────────────── seqlen_k - seqlen_q - sliding_window = 8 - 4 - 6 = -2 offset to the left
        <─┴─>
      ░ █ | █ █ █ █ █ █ █ █
      ░ ░ | █ █ █ █ █ █ █ █
@@ -79,7 +79,7 @@ def build_attention_mask(
            █ █ █ █ █
 
     SLIDING WINDOW MASK:
-         ┌──────────────────────── seqlen_k - seqlen_q - sliding_window = 5 - 3 - 2 = 0 offset to the right
+         ┌──────────────────────── seqlen_k - seqlen_q - sliding_window = 5 - 3 - 2 = 0 offset to the left
         <┴>
          | ░ █ █ █ █
          | ░ ░ █ █ █
@@ -148,9 +148,8 @@ class ContinuousBatchProcessor:
         model_device: torch.device,
         model_dtype: torch.dtype,
         scheduler: Scheduler,
-        streaming: bool = False,
-        manual_eviction: bool = False,
-        slice_inputs: bool = True,  # TODO: There should be an heuristic to decide on slicing, compile, cuda graphs...
+        streaming: bool,
+        manual_eviction: bool,
     ) -> None:
         """Initialize the continuous batch processor.
 
@@ -166,7 +165,6 @@ class ContinuousBatchProcessor:
             scheduler: The [`Scheduler`] to use
             streaming: Whether to stream tokens as they're generated
             manual_eviction: Whether to manually evict blocks from the cache
-            slice_inputs: Whether to slice the inputs to the model
         """
         self.cache = cache
         self.config = config
@@ -179,7 +177,7 @@ class ContinuousBatchProcessor:
         self.scheduler = scheduler
         self.streaming = streaming
         self.manual_eviction = manual_eviction
-        self.slice_inputs = slice_inputs
+        self._compiled_forward = None
 
         # Retrieve the size of the sliding window if there is one
         self.sliding_window = 1 if getattr(config, "sliding_window", None) is None else config.sliding_window
@@ -191,14 +189,21 @@ class ContinuousBatchProcessor:
         self.metrics = ContinuousBatchProcessorMetrics(cache.max_batch_tokens)
 
         # Setup static tensors
-        self.total_query_length = 0
-        self.total_key_length = 0
-        self.total_batch_size = 0
-        self.setup_static_tensors(cache.num_groups)
+        self.total_query_length = 0  # this is how much of the static tensors we are actually using (for q_length)
+        self.total_key_length = 0  # same for key length
+        self.total_batch_size = 0  # same for batch size # TODO: actual
+        self.setup_static_tensors(cache.num_groups) # TODO: _
+
+    def __repr__(self):
+        return (
+            f"ContinuousBatchProcessor(input_queue={self.input_queue}, output_queue={self.output_queue}, "
+            f"active_requests={self.scheduler.active_requests}, waiting_requests={self.scheduler.waiting_requests})"
+            + self.get_model_kwargs().__repr__()
+        )
 
     @traced(standalone=True)
     def setup_static_tensors(self, num_groups: int) -> None:
-        T = self.max_batch_tokens
+        T = self.max_batch_tokens  # TODO: remove and replace
         num_pages = self.cache.num_blocks * self.cache.block_size
         self.tensor_metadata = {"dtype": torch.int32, "device": self.model_device}
 
@@ -210,19 +215,21 @@ class ContinuousBatchProcessor:
         self.logits_indices = torch.empty((T,), **self.tensor_metadata)
         self.output_ids = torch.empty((1, T), **self.tensor_metadata)
 
-        # For some kwargs, we have a dict of tensors with as many items as there are attention types
+        # Retrieve all the layer types from the config
         layer_types = getattr(self.config, "layer_types", None)
         if layer_types is None:
             sliding_window = getattr(self.config, "sliding_window", 1)
             layer_types = ["full_attention"] if sliding_window in [1, None] else ["sliding_attention"]
         layer_types = list(set(layer_types))
 
+        # For some kwargs, we have a dict of tensors with as many items as there are attention types
         self.cumulative_seqlens_k = {
             layer_type: torch.empty((T + 1), **self.tensor_metadata) for layer_type in layer_types
         }
         self.max_seqlen_k = dict.fromkeys(layer_types, 0)
 
-        if self.return_attention_mask():
+        # If we need to return the attention mask, we allocate a tensor for each layer type
+        if self.config._attn_implementation != "paged_attention":
             attn_mask_kwargs = {
                 "size": (1, 1, T, num_pages + T),
                 "dtype": self.model_dtype,
@@ -238,25 +245,17 @@ class ContinuousBatchProcessor:
         # For read index, the +T is because there are -1 for seqlen_q when model uses a sliding window
 
         # After allocating empty tensors, we reset them to the right value
-        self.reset_static_tensors(full_reset=True)
-
-    def return_attention_mask(self) -> bool:
-        return self.config._attn_implementation != "paged_attention"  # we set `is_causal` to True in paged call
+        self._reset_static_tensors(full_reset=True)
 
     @traced
     @torch.no_grad()
-    def reset_static_tensors(self, full_reset: bool = False):
+    def _reset_static_tensors(self, full_reset: bool = False): 
         """Reset static tensors for the next batch. In between batches, reset only the parts that were used in the last
         batch, but for initialisation, we can reset everything using the (full_reset) flag."""
         # Compute the slice to reset
-        if full_reset or not self.slice_inputs:
-            q_len = self.write_index_storage[0].size(-1)
-            k_len = self.read_index_storage[0].size(-1)
-            b_size = self.write_index_storage[0].size(0)
-        else:
-            q_len = self.total_query_length
-            k_len = self.total_key_length
-            b_size = self.total_batch_size
+        q_len = self.write_index_storage[0].size(-1) if full_reset else self.total_query_length
+        k_len = self.read_index_storage[0].size(-1) if full_reset else self.total_key_length
+        b_size = self.write_index_storage[0].size(0) if full_reset else self.total_batch_size
 
         # Reset the attributes that always have the same shape
         self.input_ids[:, :q_len].zero_()
@@ -278,56 +277,114 @@ class ContinuousBatchProcessor:
             self.write_index_storage[i][:q_len].fill_(-1)
             self.read_index_storage[i][: q_len + k_len].fill_(-1)
 
-    def get_model_kwargs(self) -> PagedAttentionArgs:
+    def get_model_kwargs(self) -> PagedAttentionArgs: # TODO: move down
         """Get model keyword arguments for the current batch."""
         # Compute the slice to return
-        q_len = self.total_query_length if self.slice_inputs else self.write_index_storage[0].size(-1)
-        b_size = self.total_batch_size if self.slice_inputs else self.cumulative_seqlens_q.size(-1) - 1
+        q_len = self.total_query_length
+        b_size = self.total_batch_size
 
         # Prepare the kwargs, the attributes that are either tensors or dict of tensors are initialized to empty dicts
         kwargs = {
             "input_ids": self.input_ids[:, :q_len],
             "position_ids": self.position_ids[:, :q_len],
-            "cu_seq_lens_q": self.cumulative_seqlens_q[: b_size + 1],
-            "max_seqlen_q": self.max_seqlen_q,
             "logits_indices": self.logits_indices[:q_len],
-            "cu_seq_lens_k": {},
-            "max_seqlen_k": {},
-            "attention_mask": {},
             "read_index": self.read_index,  # slicing is done during building
             "write_index": self.write_index,  # slicing is done during building
             "cache": self.cache,
             "use_cache": False,
         }
 
-        # For the attributes that are dict of tensors, we replace the dict with a tensor if there is only one entry
+        # If there is no attention mask, we need to add cu_seq_lens and max_seqlen
         layer_types = list(self.cumulative_seqlens_k.keys())
-        if len(layer_types) > 1:
-            for layer_type, seqlens_k in self.cumulative_seqlens_k.items():
-                kwargs["cu_seq_lens_k"][layer_type] = seqlens_k[: b_size + 1]
-                kwargs["max_seqlen_k"][layer_type] = self.max_seqlen_k[layer_type]
-                if self.attention_mask is not None:
-                    k_len = seqlens_k[b_size] if self.slice_inputs else self.attention_mask[layer_type].size(-1)
-                    kwargs["attention_mask"][layer_type] = self.attention_mask[layer_type][..., :q_len, :k_len]
-        else:
-            layer_type = layer_types[0]
-            kwargs["cu_seq_lens_k"] = self.cumulative_seqlens_k[layer_type][: b_size + 1]
-            kwargs["max_seqlen_k"] = self.max_seqlen_k[layer_type]
-            if self.attention_mask is not None:
-                k_len = self.cumulative_seqlens_k[layer_type][b_size]
-                k_len = k_len if self.slice_inputs else self.attention_mask[layer_type].size(-1)
-                kwargs["attention_mask"] = self.attention_mask[layer_type][..., :q_len, :k_len]
-
         if self.attention_mask is None:
-            kwargs["attention_mask"] = None
+            kwargs["cu_seq_lens_q"] = self.cumulative_seqlens_q[: b_size + 1]
+            kwargs["max_seqlen_q"] = self.max_seqlen_q
+
+            if len(layer_types) > 1:
+                kwargs["cu_seq_lens_k"] = {}
+                kwargs["max_seqlen_k"] = {}
+                kwargs["attention_mask"] = {}
+                for layer_type, seqlens_k in self.cumulative_seqlens_k.items():
+                    kwargs["cu_seq_lens_k"][layer_type] = seqlens_k[: b_size + 1]
+                    kwargs["max_seqlen_k"][layer_type] = self.max_seqlen_k[layer_type]
+            else:
+                layer_type = layer_types[0]
+                kwargs["cu_seq_lens_k"] = self.cumulative_seqlens_k[layer_type][: b_size + 1]
+                kwargs["max_seqlen_k"] = self.max_seqlen_k[layer_type]
+
+        # Otherwise, we just add the attention mask(s)
+        else:
+            if len(layer_types) > 1:
+                kwargs["attention_mask"] = {}
+                for layer_type, seqlens_k in self.cumulative_seqlens_k.items():
+                    kwargs["attention_mask"][layer_type] = self.attention_mask[layer_type][:, :, :q_len, :]
+            else:
+                layer_type = layer_types[0]
+                kwargs["attention_mask"] = self.attention_mask[layer_type][:, :, :q_len, :]
+
+        print(f"{q_len = } {b_size = }")
+
         return kwargs
 
-    def __repr__(self):
-        return (
-            f"ContinuousBatchProcessor(input_queue={self.input_queue}, output_queue={self.output_queue}, "
-            f"active_requests={self.scheduler.active_requests}, waiting_requests={self.scheduler.waiting_requests})"
-            + self.get_model_kwargs().__repr__()
-        )
+    @traced(span_name="model_forward")
+    def forward_and_fill_ouput_ids(
+        self,
+        model: nn.Module,
+        batch_data: PagedAttentionArgs,
+        logit_processor,
+        do_sample: bool,
+        use_log_probs: bool,
+    ) -> torch.Tensor:
+        """Forward the model and get the logits."""
+        # If not using cuda graph, we just call the underlying function
+        # if self._compiled_forward is None:
+            # self._compiled_forward = model.forward
+        if self.total_query_length == self.max_batch_tokens:
+            if self._compiled_forward is None:
+                self._compiled_forward = torch.compile(model, mode="reduce-overhead")
+            model = self._compiled_forward
+        self._inner_forward_and_fill_output_ids(model, batch_data, logit_processor, do_sample, use_log_probs)
+
+    def _inner_forward_and_fill_output_ids(
+        self,
+        model: nn.Module,
+        batch_data: PagedAttentionArgs,
+        logit_processor,
+        do_sample: bool,
+        use_log_probs: bool,
+    ) -> None:
+        logits = model(**batch_data).logits
+
+        if use_log_probs:
+            raise NotImplementedError()
+            self.output_probs.copy_(logits)  # TODO
+
+        if hasattr(logit_processor, "set_continuous_batching_context"):
+            logit_processor.set_continuous_batching_context(
+                batch_data["logits_indices"], batch_data["cu_seq_lens_q"]
+            )
+
+        # Handle shape compatibility: logit processors expect 2D tensors [batch_size, vocab_size] but continuous
+        # batching always produces 3D tensors [batch_size, seq_len, vocab_size]
+        batch_size, seq_len, vocab_size = logits.shape
+        logits_2d = logits.view(batch_size * seq_len, vocab_size)
+        input_ids_2d = batch_data["input_ids"].view(batch_size * seq_len)
+        # Process with 2D tensors
+        processed_logits_2d = logit_processor(input_ids_2d, logits_2d)
+        # Reshape back to 3D
+        probs = processed_logits_2d.view(batch_size, seq_len, vocab_size)
+
+        if do_sample:  # sample
+            probs = nn.functional.softmax(probs, dim=-1)
+            # probs[0] has shape [seq_len, vocab_size], multinomial returns [seq_len, 1]
+            next_tokens = torch.multinomial(probs[0], num_samples=1).squeeze(-1)  # Now [seq_len]
+            # Add batch dimension back to match argmax output
+            next_tokens = next_tokens.unsqueeze(0)  # Now [1, seq_len]
+        else:
+            next_tokens = torch.argmax(probs, dim=-1)  # Already [1, seq_len]
+
+        tokens = next_tokens.size(1)  # Get seq_len dimension
+        self.output_ids[:, :tokens].copy_(next_tokens)
 
     @traced
     def _get_new_requests(self):
@@ -347,7 +404,7 @@ class ContinuousBatchProcessor:
                 if state is not None:
                     self._handle_request_error(e, state)
 
-    @traced
+    @traced # TODO: move down
     def _handle_request_error(self, error, state: RequestState):
         """Handle general request processing error."""
         state.status = RequestStatus.FAILED
@@ -379,9 +436,6 @@ class ContinuousBatchProcessor:
         if not self.requests_in_batch:
             return False
         self.metrics.record_batch_metrics(self.requests_in_batch)
-
-        # Reset the static tensors used for storage
-        self.reset_static_tensors()  # TODO: with slice_inputs, this might be unnecessary
 
         # Prepare accumulators
         self.total_query_length = 0
@@ -468,8 +522,11 @@ class ContinuousBatchProcessor:
         logits_indices: list[int],
     ) -> None:
         """Builds the actual tensors for the current batch, by modifying the already allocated tensors in place."""
-        to_tensor = partial(torch.tensor, **self.tensor_metadata)
 
+        # Depending on the backend, we determine how much of the static tensor we need to slice and thus reset
+        self._reset_static_tensors()
+
+        to_tensor = partial(torch.tensor, **self.tensor_metadata)
         # Those kwargs always have the same type regardless of the model
         self.input_ids[:, : len(input_ids)] = to_tensor(input_ids)
         self.position_ids[:, : len(position_ids)] = to_tensor(position_ids)
@@ -495,8 +552,8 @@ class ContinuousBatchProcessor:
             self.read_index_storage[i][: len(group_read_indices)] = to_tensor(group_read_indices)
             self.write_index_storage[i][: len(group_write_indices)] = to_tensor(group_write_indices)
             # Slice to the right size
-            r = len(group_read_indices) if self.slice_inputs else self.read_index_storage[i].size(-1)
-            w = len(group_write_indices) if self.slice_inputs else self.write_index_storage[i].size(-1)
+            r = len(group_read_indices)
+            w = len(group_write_indices)
             # Add to the index
             self.read_index.append(self.read_index_storage[i][:r])
             self.write_index.append(self.write_index_storage[i][:w])
@@ -513,11 +570,9 @@ class ContinuousBatchProcessor:
         return out
 
     @traced
-    def _maybe_send_output(self, state: RequestState, token: int):
+    def _maybe_send_output(self, state: RequestState):
         """Send output to the queue based on streaming mode and request state."""
-        if self.streaming:
-            self.output_queue.put(state.to_generation_output())
-        elif state.status == RequestStatus.FINISHED:
+        if self.streaming or state.status == RequestStatus.FINISHED:
             self.output_queue.put(state.to_generation_output())
 
     @traced
@@ -536,7 +591,7 @@ class ContinuousBatchProcessor:
                     self.metrics.record_request_completion(state.created_time, state.request_id)
                     self.scheduler.finish_request(state.request_id, evict_from_cache=(not self.manual_eviction))
                     finished_request_ids.append(req_id)
-                self._maybe_send_output(state, token)
+                self._maybe_send_output(state)
             elif state.status == RequestStatus.PREFILLING_SPLIT:
                 state.status = RequestStatus.SPLIT_PENDING_REMAINDER
         if self.cache.get_num_free_blocks() == 0:
@@ -588,66 +643,58 @@ class ContinuousBatchingManager:
 
     def __init__(
         self,
-        model,
-        generation_config: GenerationConfig,
+        model: "ContinuousMixin",
+        generation_config: Optional[GenerationConfig],
         manual_eviction: bool = False,
-        max_queue_size=0,
+        max_queue_size: int = 0,
         streaming: bool = True,
-        slice_inputs: bool = True,
-    ):
+        default_timeout: float = 10,
+    ) -> None:
         """Initialize the continuous batching manager.
 
         Args:
+
             model: The language model for generation
-            generation_config: Configuration for generation parameters
+            generation_config: An optional GenerationConfig object
+            manual_eviction: Whether to manually evict requests from the cache
             max_queue_size: Maximum size of the request queue (0 = unlimited)
             streaming: Whether to stream tokens as they are generated
         """
         self.model = model.eval()
-        generation_config = model.generation_config if generation_config is None else generation_config
-        self.generation_config = generation_config
+        self.generation_config = model.generation_config if generation_config is None else generation_config
+        self.manual_eviction = manual_eviction
+        self.streaming = streaming
+        self.default_timeout = default_timeout
+        # Initialize async-related attributes
         self.input_queue = queue.Queue(maxsize=max_queue_size)
         self.output_queue = queue.Queue()
         self.stop_event = threading.Event()
-        self.streaming = streaming
-        self.log_prob_generation = getattr(generation_config, "log_prob_generation", False)
         self._generation_thread = None
         self._request_counter = 0
         self._request_lock = threading.Lock()
-        self.model.generation_config.top_p = None
-        self.do_sample = getattr(generation_config, "do_sample", True)
-        self.logit_processor = self.model._get_logits_processor(generation_config)
-        self.use_cuda_graph = getattr(generation_config, "use_cuda_graph", False)  # TODO: same as do_sample
-        self.profile = getattr(generation_config, "profile", False)
-        self.manual_eviction = manual_eviction
+        # Set the processor to None, it will be initialized in the start method
         self.batch_processor: Optional[ContinuousBatchProcessor] = None
-        self.slice_inputs = slice_inputs
 
-        if self.use_cuda_graph:
-            raise NotImplementedError("Cuda graphs are not supported yet")
+    @property
+    def logit_processor(self):
+        return self.model._get_logits_processor(self.generation_config)
+
+    def is_running(self):
+        """Checks if the background generation thread is running."""
+        return self._generation_thread is not None and self._generation_thread.is_alive()
 
     @traced
     def start(self):
-        """Start the background generation thread."""
-        if self._generation_thread is not None and self._generation_thread.is_alive():
+        """Starts the background generation thread."""
+        if self.is_running():
             logger.warning("Manager thread is already running.")
             return
-
-        self._result_queue = queue.Queue()
         self._generation_thread = threading.Thread(target=self._run_generation_loop)
         self._generation_thread.start()
 
-    def is_running(self):
-        """Check if the background generation thread is running."""
-        return self._generation_thread is not None and self._generation_thread.is_alive()
-
     def stop(self, block: bool = False, timeout: Optional[float] = None):
-        """Signal the background thread to stop.
-
-        Args:
-            block: Whether to wait for the thread to stop
-            timeout: Maximum time to wait for the thread to stop
-        """
+        """Signals the background thread to stop. If the (block) flag is set, we wait for the thread to stop, for at
+        most (timeout) seconds."""
         if self._generation_thread is None:
             logger.warning("Manager not started.")
             return
@@ -660,11 +707,7 @@ class ContinuousBatchingManager:
             self.join(timeout)
 
     def join(self, timeout: Optional[float] = None):
-        """Wait for the background thread to finish.
-
-        Args:
-            timeout: Maximum time to wait for the thread to stop
-        """
+        """Waits for the background thread to finish, for at most (timeout) seconds."""
         if self._generation_thread is not None:
             self._generation_thread.join(timeout=timeout)
             if self._generation_thread.is_alive():
@@ -674,18 +717,15 @@ class ContinuousBatchingManager:
                 self._generation_thread = None
 
     def add_request(
-        self, input_ids: list[int], request_id: Optional[str] = None, max_new_tokens: Optional[int] = None
+        self,
+        input_ids: list[int],
+        request_id: Optional[str] = None,
+        max_new_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> str:
-        """Add a new generation request to the queue.
-
-        Args:
-            input_ids: Input token IDs to use as prompt
-            request_id: Optional custom request ID (auto-generated if None)
-            **kwargs: Additional generation parameters
-
-        Returns:
-            str: The request ID
-        """
+        """Adds a new generation request to the queue. The request's is defined by its initial (input_ids), an optional
+        (request_id), which is auto-generated if not provided, and an optional (max_new_tokens) limit.
+        The request's ID is returned."""
         if request_id is None:
             with self._request_lock:
                 request_id = f"req_{self._request_counter}"
@@ -701,34 +741,28 @@ class ContinuousBatchingManager:
             max_new_tokens=max_new_tokens,
             eos_token_id=self.generation_config.eos_token_id,
         )
-
         # Use block=True with timeout to handle backpressure if queue is full
-        self.input_queue.put(state, block=True, timeout=10)  # XXX: pass timeout as fn arg?
+        timeout = self.default_timeout if timeout is None else timeout
+        self.input_queue.put(state, block=True, timeout=timeout)
         logger.debug(f"Added request {request_id} to queue.")
         return request_id
 
     def add_requests(self, inputs: list[list[int]], **kwargs):
+        """Adds multiple requests to the queue. For kwargs, see add_request."""
         for input_ids in inputs:
             self.add_request(input_ids, **kwargs)
 
     def cancel_request(self, request_id: str):
-        """Cancel a request by its ID.
-
-        Args:
-            request_id: The ID of the request to cancel
-        """
+        """Cancels a request by using its (request_id)."""
         if self.batch_processor is not None:
             self.batch_processor.scheduler.set_request_cancellation(request_id)
 
     def get_result(self, request_id=None, timeout=None) -> Optional[GenerationOutput]:
-        """Retrieve one result from the output queue.
-
-        Args:
-            timeout: Maximum time to wait for a result
-
-        Returns:
-            Optional[GenerationOutput]: The result data or None if timeout
+        """Retrieves the first result from the output queue. If the output queue is empty or the timeout is reached,
+        returns None. If a (request_id) is specified and the result does not correspond to that request, it is put back
+        in the queue and None is returned.
         """
+        timeout = self.default_timeout if timeout is None else timeout
         if self._generation_thread is None and self.output_queue.empty():
             return None
         try:
@@ -743,7 +777,7 @@ class ContinuousBatchingManager:
 
     def __iter__(self):
         """Iterate over results as they become available."""
-        while self._generation_thread is not None and self._generation_thread.is_alive():
+        while self.is_running():
             result = self.get_result(timeout=0.1)
             if result is not None:
                 yield result
@@ -751,7 +785,7 @@ class ContinuousBatchingManager:
     def request_id_iter(self, request_id):
         """Iterate over results matching a specific request id as they become available."""
         request_cancelled = False
-        while self._generation_thread is not None and self._generation_thread.is_alive() and not request_cancelled:
+        while self.is_running() and not request_cancelled:
             result = self.get_result(request_id=request_id, timeout=0.1)
             if result is not None:
                 yield result
@@ -767,33 +801,18 @@ class ContinuousBatchingManager:
         return "sdpa_paged"
 
     @traced
-    def warmup(self, batch_processor):
-        stream = torch.cuda.Stream(device=self.model.device)
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            # Warmup the model with a dummy forward pass
-            self._generation_step(batch_processor)
-        torch.cuda.current_stream().wait_stream(stream)
-
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph, stream=stream):
-            self._generation_step(batch_processor)
-
-    @traced
     # @torch.compile
-    def _generation_step(self, batch_processor: ContinuousBatchProcessor):
-        """Perform a single generation step. This is cuda graphed"""
+    def _forward_and_fill_ouput_ids(self, batch_processor: ContinuousBatchProcessor):
+        """Perform a single generation step."""
         batch_data = batch_processor.get_model_kwargs()
         with torch.no_grad():
-            logits = self._model_forward(batch_data)
-            if self.log_prob_generation:
-                batch_processor.output_probs.copy_(logits)  # TODO
-            probs = self._process_logit(batch_data, logits)
-            self._sample(batch_processor, probs)
-
-    @traced(span_name="model_forward")
-    def _model_forward(self, batch_data):
-        return self.model(**batch_data).logits
+            batch_processor.forward_and_fill_ouput_ids(
+                self.model,
+                batch_data,
+                self.logit_processor,
+                self.generation_config.do_sample,
+                use_log_probs=getattr(self.generation_config, "log_prob_generation", False),
+            )
 
     @traced(span_name="logit_processing")
     def _process_logit(self, batch_data, logits):
@@ -817,7 +836,7 @@ class ContinuousBatchingManager:
 
     @traced(span_name="sampling")
     def _sample(self, batch_processor: ContinuousBatchProcessor, probs):
-        if self.do_sample:  # sample
+        if getattr(self.generation_config, "do_sample", True):  # sample
             probs = nn.functional.softmax(probs, dim=-1)
             # probs[0] has shape [seq_len, vocab_size], multinomial returns [seq_len, 1]
             next_tokens = torch.multinomial(probs[0], num_samples=1).squeeze(-1)  # Now [seq_len]
@@ -866,7 +885,6 @@ class ContinuousBatchingManager:
                 scheduler(paged_attention_cache, self.manual_eviction),
                 self.streaming,
                 self.manual_eviction,
-                slice_inputs=self.slice_inputs,
             )
             self.batch_processor = batch_processor
             self.current_batch = 0
@@ -890,20 +908,7 @@ class ContinuousBatchingManager:
         if logger.level <= logging.DEBUG:
             device, total, reserved, allocated = get_device_and_memory_breakdown()
             logger.debug(f"[Memory] Device: {device}, Total: {total}, Reserved: {reserved}, Allocated: {allocated}")
-        if torch.cuda.is_available() and self.use_cuda_graph:
-            if self.current_batch == 0:
-                self.warmup(batch_processor)
-            elif hasattr(self, "graph"):
-                try:
-                    self._graph_replay()
-                except Exception as e:
-                    logger.error(f"Model forward pass failed: {e}", exc_info=True)
-                    batch_processor.handle_batch_error(e)
-                    return
-            else:
-                self._generation_step(batch_processor)
-        else:
-            self._generation_step(batch_processor)
+        self._forward_and_fill_ouput_ids(batch_processor)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         batch_processor.update_batch()
@@ -946,17 +951,11 @@ class ContinuousMixin:
     def init_continuous_batching(
         self,
         generation_config: Optional[GenerationConfig] = None,
-        manual_eviction: bool = False,
-        max_queue_size: int = 0,
-        streaming: bool = False,
-        slice_inputs: bool = True,
     ) -> ContinuousBatchingManager:
         """Initialize a manager for continuous batching inference.
 
         Args:
             generation_config: Custom generation configuration
-            max_queue_size: Maximum size of the input request queue
-            streaming: Whether to stream tokens as they are generated
 
         Returns:
             `ContinuousBatchingManager`: The manager instance to add requests and retrieve results.
@@ -976,10 +975,9 @@ class ContinuousMixin:
         return ContinuousBatchingManager(
             model=self,
             generation_config=gen_config,
-            manual_eviction=manual_eviction,
-            max_queue_size=max_queue_size,
-            streaming=streaming,
-            slice_inputs=slice_inputs,
+            manual_eviction=False,
+            max_queue_size=0,
+            streaming=False,
         )
 
     @traced
@@ -989,20 +987,18 @@ class ContinuousMixin:
         inputs: list[list[int]],
         generation_config: Optional[GenerationConfig] = None,
         progress_bar: bool = True,
-        slice_inputs: bool = True,
         **kwargs,
     ) -> list[list[int]]:
         """Generate sequences for a batch of prompts using continuous batching.
 
         Args:
             inputs: List of input token sequences (prompts)
-            generation_config: Optional generation configuration
-            **kwargs: Additional generation parameters
+            generation_config: An optional generation configuration
+            progress_bar: Whether to show a progress bar or not
 
         Returns:
-            `list[list[int]]`: A list containing the generated sequences (including prompt tokens
-                                if not handled otherwise) for each input prompt, in the same order.
-                                Returns an empty list `[]` for requests that failed.
+            `list[list[int]]`: A list containing the generated sequences (including prompt tokens if not handled
+            otherwise) for each input prompt, in the same order. Returns an empty list `[]` for requests that failed.
         """
         if not inputs:
             return []
@@ -1011,7 +1007,7 @@ class ContinuousMixin:
             progress_bar = False
 
         # Initialize manager with the batch inputs
-        manager = self.init_continuous_batching(generation_config=generation_config, slice_inputs=slice_inputs)
+        manager = self.init_continuous_batching(generation_config=generation_config)
         manager.start()
         results = {}
         num_requests = len(inputs)
