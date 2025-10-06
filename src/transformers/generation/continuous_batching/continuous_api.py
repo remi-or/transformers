@@ -151,7 +151,6 @@ class ContinuousBatchProcessor:
         scheduler: Scheduler,
         streaming: bool = False,
         manual_eviction: bool = False,
-        slice_inputs: bool = True,  # TODO: There should be an heuristic to decide on slicing, compile, cuda graphs...
     ) -> None:
         """Initialize the continuous batch processor.
 
@@ -167,7 +166,6 @@ class ContinuousBatchProcessor:
             scheduler: The [`Scheduler`] to use
             streaming: Whether to stream tokens as they're generated
             manual_eviction: Whether to manually evict blocks from the cache
-            slice_inputs: Whether to slice the inputs to the model
         """
         self.cache = cache
         self.config = config
@@ -180,7 +178,6 @@ class ContinuousBatchProcessor:
         self.scheduler = scheduler
         self.streaming = streaming
         self.manual_eviction = manual_eviction
-        self.slice_inputs = slice_inputs
 
         # Retrieve the size of the sliding window if there is one
         self.sliding_window = 1 if getattr(config, "sliding_window", None) is None else config.sliding_window
@@ -253,14 +250,9 @@ class ContinuousBatchProcessor:
         """Reset static tensors for the next batch. In between batches, reset only the parts that were used in the last
         batch, but for initialisation, we can reset everything using the (full_reset) flag."""
         # Compute the slice to reset
-        if full_reset or not self.slice_inputs:
-            q_len = self.write_index_storage[0].size(-1)
-            k_len = self.read_index_storage[0].size(-1)
-            b_size = self.write_index_storage[0].size(0)
-        else:
-            q_len = self.total_query_length
-            k_len = self.total_key_length
-            b_size = self.total_batch_size
+        q_len = self.write_index_storage[0].size(-1) if full_reset else self.total_query_length
+        k_len = self.read_index_storage[0].size(-1) if full_reset else self.total_key_length
+        b_size = self.write_index_storage[0].size(0) if full_reset else self.total_batch_size
 
         # Reset the attributes that always have the same shape
         self.input_ids[:, :q_len].zero_()
@@ -285,8 +277,8 @@ class ContinuousBatchProcessor:
     def get_model_kwargs(self) -> PagedAttentionArgs:
         """Get model keyword arguments for the current batch."""
         # Compute the slice to return
-        q_len = self.total_query_length if self.slice_inputs else self.write_index_storage[0].size(-1)
-        b_size = self.total_batch_size if self.slice_inputs else self.cumulative_seqlens_q.size(-1) - 1
+        q_len = self.total_query_length
+        b_size = self.total_batch_size
 
         # Prepare the kwargs, the attributes that are either tensors or dict of tensors are initialized to empty dicts
         kwargs = {
@@ -311,7 +303,7 @@ class ContinuousBatchProcessor:
                 kwargs["cu_seq_lens_k"][layer_type] = seqlens_k[: b_size + 1]
                 kwargs["max_seqlen_k"][layer_type] = self.max_seqlen_k[layer_type]
                 if self.attention_mask is not None:
-                    k_len = seqlens_k[b_size] if self.slice_inputs else self.attention_mask[layer_type].size(-1)
+                    k_len = seqlens_k[b_size]
                     kwargs["attention_mask"][layer_type] = self.attention_mask[layer_type][..., :q_len, :k_len]
         else:
             layer_type = layer_types[0]
@@ -319,7 +311,6 @@ class ContinuousBatchProcessor:
             kwargs["max_seqlen_k"] = self.max_seqlen_k[layer_type]
             if self.attention_mask is not None:
                 k_len = self.cumulative_seqlens_k[layer_type][b_size]
-                k_len = k_len if self.slice_inputs else self.attention_mask[layer_type].size(-1)
                 kwargs["attention_mask"] = self.attention_mask[layer_type][..., :q_len, :k_len]
 
         if self.attention_mask is None:
@@ -385,7 +376,7 @@ class ContinuousBatchProcessor:
         self.metrics.record_batch_metrics(self.requests_in_batch)
 
         # Reset the static tensors used for storage
-        self.reset_static_tensors()  # TODO: with slice_inputs, this might be unnecessary
+        self.reset_static_tensors()  # TODO: this might be unnecessary
 
         # Prepare accumulators
         self.total_query_length = 0
@@ -499,8 +490,8 @@ class ContinuousBatchProcessor:
             self.read_index_storage[i][: len(group_read_indices)] = to_tensor(group_read_indices)
             self.write_index_storage[i][: len(group_write_indices)] = to_tensor(group_write_indices)
             # Slice to the right size
-            r = len(group_read_indices) if self.slice_inputs else self.read_index_storage[i].size(-1)
-            w = len(group_write_indices) if self.slice_inputs else self.write_index_storage[i].size(-1)
+            r = len(group_read_indices)
+            w = len(group_write_indices)
             # Add to the index
             self.read_index.append(self.read_index_storage[i][:r])
             self.write_index.append(self.write_index_storage[i][:w])
@@ -592,7 +583,6 @@ class ContinuousBatchingManager:
         manual_eviction: bool = False,
         max_queue_size: int = 0,
         streaming: bool = True,
-        slice_inputs: bool = True,
     ) -> None:
         """Initialize the continuous batching manager.
 
@@ -631,7 +621,6 @@ class ContinuousBatchingManager:
         self.profile = getattr(generation_config, "profile", False)  # TODO: not supported yet
         self.manual_eviction = manual_eviction
         self.batch_processor: Optional[ContinuousBatchProcessor] = None
-        self.slice_inputs = slice_inputs
 
         if self.use_cuda_graph:
             raise NotImplementedError("Cuda graphs are not supported yet")
@@ -869,7 +858,6 @@ class ContinuousBatchingManager:
                 scheduler(paged_attention_cache, self.manual_eviction),
                 self.streaming,
                 self.manual_eviction,
-                slice_inputs=self.slice_inputs,
             )
             self.batch_processor = batch_processor
             self.current_batch = 0
@@ -952,7 +940,6 @@ class ContinuousMixin:
         manual_eviction: bool = False,
         max_queue_size: int = 0,
         streaming: bool = False,
-        slice_inputs: bool = True,
     ) -> ContinuousBatchingManager:
         """Initialize a manager for continuous batching inference.
 
@@ -982,7 +969,6 @@ class ContinuousMixin:
             manual_eviction=manual_eviction,
             max_queue_size=max_queue_size,
             streaming=streaming,
-            slice_inputs=slice_inputs,
         )
 
     @traced
@@ -992,7 +978,6 @@ class ContinuousMixin:
         inputs: list[list[int]],
         generation_config: Optional[GenerationConfig] = None,
         progress_bar: bool = True,
-        slice_inputs: bool = True,
         **kwargs,
     ) -> dict[str, GenerationOutput]:
         """Generate sequences for a batch of prompts using continuous batching.
@@ -1014,7 +999,7 @@ class ContinuousMixin:
             progress_bar = False
 
         # Initialize manager with the batch inputs
-        manager = self.init_continuous_batching(generation_config=generation_config, slice_inputs=slice_inputs)
+        manager = self.init_continuous_batching(generation_config=generation_config)
         manager.start()
         results = {}
         num_requests = len(inputs)
@@ -1048,3 +1033,12 @@ class ContinuousMixin:
         finally:
             manager.stop(block=True, timeout=5.0)
         return results
+
+"""
+ROADMAP:
+make slice inputs the default
+make .update graphable (add padding)
+enable cuda graphs for flash attention
+
+further reformat / cleanup
+"""
