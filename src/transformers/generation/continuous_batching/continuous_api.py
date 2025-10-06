@@ -57,7 +57,7 @@ def build_attention_mask(
            █ █ █ █ █ █ █ █
 
     SLIDING WINDOW MASK:
-         ┌──────────────────────── seqlen_k - seqlen_q - sliding_window = 8 - 4 - 6 = -2 offset to the right
+         ┌──────────────────────── seqlen_k - seqlen_q - sliding_window = 8 - 4 - 6 = -2 offset to the left
        <─┴─>
      ░ █ | █ █ █ █ █ █ █ █
      ░ ░ | █ █ █ █ █ █ █ █
@@ -80,7 +80,7 @@ def build_attention_mask(
            █ █ █ █ █
 
     SLIDING WINDOW MASK:
-         ┌──────────────────────── seqlen_k - seqlen_q - sliding_window = 5 - 3 - 2 = 0 offset to the right
+         ┌──────────────────────── seqlen_k - seqlen_q - sliding_window = 5 - 3 - 2 = 0 offset to the left
         <┴>
          | ░ █ █ █ █
          | ░ ░ █ █ █
@@ -249,7 +249,7 @@ class ContinuousBatchProcessor:
 
     @traced
     @torch.no_grad()
-    def reset_static_tensors(self, full_reset: bool = False):
+    def reset_static_tensors(self, full_reset: bool = False) -> None:
         """Reset static tensors for the next batch. In between batches, reset only the parts that were used in the last
         batch, but for initialisation, we can reset everything using the (full_reset) flag."""
         # Compute the slice to reset
@@ -326,7 +326,7 @@ class ContinuousBatchProcessor:
             kwargs["attention_mask"] = None
         return kwargs
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"ContinuousBatchProcessor(input_queue={self.input_queue}, output_queue={self.output_queue}, "
             f"active_requests={self.scheduler.active_requests}, waiting_requests={self.scheduler.waiting_requests})"
@@ -334,7 +334,7 @@ class ContinuousBatchProcessor:
         )
 
     @traced
-    def _get_new_requests(self):
+    def _get_new_requests(self) -> None:
         """Pull new requests from the input queue and add to waiting list."""
         while not self.input_queue.empty():
             try:
@@ -352,7 +352,7 @@ class ContinuousBatchProcessor:
                     self._handle_request_error(e, state)
 
     @traced
-    def _handle_request_error(self, error, state: RequestState):
+    def _handle_request_error(self, error: Exception, state: RequestState) -> None:
         """Handle general request processing error."""
         state.status = RequestStatus.FAILED
         state.error = str(error)
@@ -506,18 +506,16 @@ class ContinuousBatchProcessor:
             self.write_index.append(self.write_index_storage[i][:w])
 
     @traced
-    def _sync(self):
+    def _sync(self) -> list[int]:
         if self.output_ids is not None:
             try:
-                out = self.output_ids.tolist()[0]  # should be the only sync we do
+                return self.output_ids.tolist()[0]
             except Exception:
-                out = [0, 1]
-        else:
-            out = [0, 0]
-        return out
+                return [0, 1]
+        return [0, 0]
 
     @traced
-    def _maybe_send_output(self, state: RequestState, token: int):
+    def _maybe_send_output(self, state: RequestState, token: int) -> None:
         """Send output to the queue based on streaming mode and request state."""
         if self.streaming:
             self.output_queue.put(state.to_generation_output())
@@ -525,12 +523,12 @@ class ContinuousBatchProcessor:
             self.output_queue.put(state.to_generation_output())
 
     @traced
-    def update_batch(self):
+    def update_batch(self) -> None:
         """Update request states based on generated tokens."""
         out_tokens = self._sync()
-        finished_request_ids = []
+        finished_request_ids = []  # CHECK: unused variable
         for i, state in enumerate(self.requests_in_batch):
-            req_id = state.request_id
+            req_id = state.request_id  # CHECK: unused variable
             if len(state.remaining_prompt_ids) == 0:
                 self.metrics.record_ttft_metric(state.created_time, state.request_id)
                 state.status = RequestStatus.DECODING
@@ -560,7 +558,7 @@ class ContinuousBatchProcessor:
             self.scheduler.finish_request(req.request_id)
 
     @traced
-    def fail_all_requests(self, error):
+    def fail_all_requests(self, error: Exception) -> None:
         """Fail all active requests with the given error.
 
         Args:
@@ -592,15 +590,14 @@ class ContinuousBatchingManager:
 
     def __init__(
         self,
-        model,
+        model: nn.Module,
         generation_config: GenerationConfig,
         manual_eviction: bool = False,
-        max_queue_size=0,
+        max_queue_size: int = 0,
         streaming: bool = True,
         slice_inputs: bool = True,
-    ):
-        """
-        Initialize the continuous batching manager.
+    ) -> None:
+        """Initialize the continuous batching manager.
 
         Args:
             model: The language model for generation
@@ -643,7 +640,7 @@ class ContinuousBatchingManager:
             raise NotImplementedError("Cuda graphs are not supported yet")
 
     @traced
-    def start(self):
+    def start(self) -> None:
         """Start the background generation thread."""
         if self._generation_thread is not None and self._generation_thread.is_alive():
             logger.warning("Manager thread is already running.")
@@ -653,11 +650,11 @@ class ContinuousBatchingManager:
         self._generation_thread = threading.Thread(target=self._run_generation_loop)
         self._generation_thread.start()
 
-    def is_running(self):
+    def is_running(self) -> bool:
         """Check if the background generation thread is running."""
         return self._generation_thread is not None and self._generation_thread.is_alive()
 
-    def stop(self, block: bool = False, timeout: Optional[float] = None):
+    def stop(self, block: bool = False, timeout: Optional[float] = None) -> None:
         """Signal the background thread to stop.
 
         Args:
@@ -675,7 +672,7 @@ class ContinuousBatchingManager:
         if block:
             self.join(timeout)
 
-    def join(self, timeout: Optional[float] = None):
+    def join(self, timeout: Optional[float] = None) -> None:
         """Wait for the background thread to finish.
 
         Args:
@@ -723,11 +720,11 @@ class ContinuousBatchingManager:
         logger.debug(f"Added request {request_id} to queue.")
         return request_id
 
-    def add_requests(self, inputs: list[list[int]], **kwargs):
+    def add_requests(self, inputs: list[list[int]], **kwargs) -> None:
         for input_ids in inputs:
             self.add_request(input_ids, **kwargs)
 
-    def cancel_request(self, request_id: str):
+    def cancel_request(self, request_id: str) -> None:
         """Cancel a request by its ID.
 
         Args:
@@ -736,7 +733,7 @@ class ContinuousBatchingManager:
         if self.batch_processor is not None:
             self.batch_processor.scheduler.set_request_cancellation(request_id)
 
-    def get_result(self, request_id=None, timeout=None) -> Optional[GenerationOutput]:
+    def get_result(self, request_id: Optional[str] = None, timeout: Optional[float] = None) -> Optional[GenerationOutput]:
         """Retrieve one result from the output queue.
 
         Args:
@@ -764,7 +761,7 @@ class ContinuousBatchingManager:
             if result is not None:
                 yield result
 
-    def request_id_iter(self, request_id):
+    def request_id_iter(self, request_id: str) -> None:
         """Iterate over results matching a specific request id as they become available."""
         request_cancelled = False
         while self._generation_thread is not None and self._generation_thread.is_alive() and not request_cancelled:
@@ -775,7 +772,7 @@ class ContinuousBatchingManager:
                 request_cancelled = self.batch_processor.scheduler.request_is_cancelled(request_id)
 
     @traced
-    def warmup(self, batch_processor):
+    def warmup(self, batch_processor: ContinuousBatchProcessor) -> None:
         stream = torch.cuda.Stream(device=self.model.device)
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
@@ -789,7 +786,7 @@ class ContinuousBatchingManager:
 
     @traced
     # @torch.compile
-    def _generation_step(self, batch_processor: ContinuousBatchProcessor):
+    def _generation_step(self, batch_processor: ContinuousBatchProcessor) -> None:
         """Perform a single generation step. This is cuda graphed"""
         batch_data = batch_processor.get_model_kwargs()
         with torch.no_grad():
@@ -800,11 +797,11 @@ class ContinuousBatchingManager:
             self._sample(batch_processor, probs)
 
     @traced(span_name="model_forward")
-    def _model_forward(self, batch_data):
+    def _model_forward(self, batch_data: dict) -> torch.Tensor:
         return self.model(**batch_data).logits
 
     @traced(span_name="logit_processing")
-    def _process_logit(self, batch_data, logits):
+    def _process_logit(self, batch_data: dict, logits: torch.Tensor) -> torch.Tensor:
         # Pass continuous batching context to logits processor if it supports it. TODO we should find a way to make this a little bit cleaner!
         if hasattr(self.logit_processor, "set_continuous_batching_context"):
             self.logit_processor.set_continuous_batching_context(
@@ -824,7 +821,7 @@ class ContinuousBatchingManager:
         return processed_logits_2d.view(batch_size, seq_len, vocab_size)
 
     @traced(span_name="sampling")
-    def _sample(self, batch_processor: ContinuousBatchProcessor, probs):
+    def _sample(self, batch_processor: ContinuousBatchProcessor, probs: torch.Tensor) -> None:
         if self.do_sample:  # sample
             probs = nn.functional.softmax(probs, dim=-1)
             # probs[0] has shape [seq_len, vocab_size], multinomial returns [seq_len, 1]
@@ -837,11 +834,11 @@ class ContinuousBatchingManager:
         tokens = next_tokens.size(1)  # Get seq_len dimension
         batch_processor.output_ids[:, :tokens].copy_(next_tokens)
 
-    def _run_generation_loop(self):
+    def _run_generation_loop(self) -> None:
         """Main processing loop running in the background thread."""
-        batch_processor = None
+        batch_processor: Optional[ContinuousBatchProcessor] = None
         try:
-            ref_time = perf_counter()
+            t0 = perf_counter()
             paged_attention_cache = PagedAttentionCache(
                 self.model.config,
                 self.generation_config,
@@ -849,7 +846,7 @@ class ContinuousBatchingManager:
                 self.model.dtype,
                 tp_size=getattr(self.model, "_tp_size", None),  # Use model's actual TP setting
             )
-            logger.debug(f"PagedAttentionCache created in {perf_counter() - ref_time} seconds")
+            logger.debug(f"PagedAttentionCache created in {perf_counter() - t0} seconds")
 
             scheduler = None
             if hasattr(self.generation_config, "scheduler"):
@@ -861,7 +858,7 @@ class ContinuousBatchingManager:
                 # Default to fifo
                 scheduler = FIFOScheduler
 
-            ref_time = perf_counter()
+            t1 = perf_counter()
             batch_processor = ContinuousBatchProcessor(
                 paged_attention_cache,
                 self.model.config,
@@ -878,7 +875,7 @@ class ContinuousBatchingManager:
             )
             self.batch_processor = batch_processor
             self.current_batch = 0
-            logger.debug(f"batch_processor created in {perf_counter() - ref_time} seconds")
+            logger.debug(f"batch_processor created in {perf_counter() - t1} seconds")
             while (not self.stop_event.is_set()) or batch_processor.has_pending_requests():
                 self._inner_generation_loop(batch_processor)
                 self.current_batch += 1
@@ -890,7 +887,7 @@ class ContinuousBatchingManager:
             logger.info("Generation loop finished.")
 
     @traced(span_name="generation_loop")
-    def _inner_generation_loop(self, batch_processor: ContinuousBatchProcessor):
+    def _inner_generation_loop(self, batch_processor: ContinuousBatchProcessor) -> None:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         if not batch_processor.prepare_next_batch():
@@ -917,11 +914,11 @@ class ContinuousBatchingManager:
         batch_processor.update_batch()
 
     @traced(span_name="graph_replay")
-    def _graph_replay(self):
+    def _graph_replay(self) -> None:
         self.graph.replay()
 
     @traced
-    def _handle_critical_error(self, error, batch_processor: Optional[ContinuousBatchProcessor]):
+    def _handle_critical_error(self, error: Exception, batch_processor: Optional[ContinuousBatchProcessor]) -> None:
         """Handle critical errors that terminate the generation loop."""
         # Signal stop
         self.stop_event.set()
@@ -940,7 +937,7 @@ class ContinuousBatchingManager:
             batch_processor.fail_all_requests(error)
 
     @traced
-    def evict_request_from_cache(self, request_id: str):
+    def evict_request_from_cache(self, request_id: str) -> None:
         """Evict a request from the cache. It is assumed that the request is already finished."""
         if not self.manual_eviction:
             raise RuntimeError("Manual eviction is not enabled for this manager.")
@@ -999,7 +996,7 @@ class ContinuousMixin:
         progress_bar: bool = True,
         slice_inputs: bool = True,
         **kwargs,
-    ) -> list[list[int]]:
+    ) -> dict[str, GenerationOutput]:
         """Generate sequences for a batch of prompts using continuous batching.
 
         Args:
@@ -1013,7 +1010,7 @@ class ContinuousMixin:
                                 Returns an empty list `[]` for requests that failed.
         """
         if not inputs:
-            return []
+            return {}
         if logger.getEffectiveLevel() <= logging.DEBUG:
             logger.warning("Progress bar is disabled when logger level is less than DEBUG")
             progress_bar = False
