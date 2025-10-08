@@ -35,6 +35,9 @@ if is_vision_available():
 
 
 class DetrImageProcessingTester(unittest.TestCase):
+
+    _testMethodName = "test_image_processing_detr"
+
     def __init__(
         self,
         parent,

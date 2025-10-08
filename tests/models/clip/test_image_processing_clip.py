@@ -27,6 +27,9 @@ if is_vision_available():
 
 
 class CLIPImageProcessingTester(unittest.TestCase):
+
+    _testMethodName = "test_image_processing_clip"
+
     def __init__(
         self,
         parent,

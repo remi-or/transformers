@@ -51,6 +51,9 @@ def floats_list(shape, scale=1.0, rng=None, name=None):
 
 
 class WhisperFeatureExtractionTester(unittest.TestCase):
+
+    _testMethodName = "test_feature_extraction_whisper"
+
     def __init__(
         self,
         parent,
